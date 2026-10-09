@@ -121,6 +121,10 @@ struct Cli {
     /// Output as JSON instead of tables
     #[arg(short, long)]
     json: bool,
+
+    /// Suppress all status messages; print only the requested output
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,7 +1029,9 @@ fn print_report(report: &Report) {
 
 fn run_query(cli: &Cli, config: &Config) -> Result<()> {
     let Some((name, profile)) = resolve_profile(config, cli.profile.as_deref())? else {
-        eprintln!("Cancelled.");
+        if !cli.quiet {
+            eprintln!("Cancelled.");
+        }
         return Ok(());
     };
 
@@ -1041,7 +1047,9 @@ fn run_query(cli: &Cli, config: &Config) -> Result<()> {
         None
     };
 
-    eprintln!("Connecting to user portal as {} ({})…", name, profile.id);
+    if !cli.quiet {
+        eprintln!("Connecting to user portal as {} ({})…", name, profile.id);
+    }
     let portal = UserPortal::login(&profile)?;
 
     let mut report = Report {
