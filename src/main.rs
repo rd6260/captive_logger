@@ -189,7 +189,7 @@ fn human(n: u64) -> String {
 }
 
 /// Parses a portal data string like "8095.75 MB" or "1.2 GB" into bytes,
-/// then formats it in binary units (GiB / MiB / KiB / B), choosing the
+/// then formats it in binary units (TiB / GiB / MiB / KiB / B), choosing the
 /// largest unit that keeps the value ≥ 1.
 fn format_data_size(s: &str) -> Option<String> {
     let s = s.trim();
@@ -207,11 +207,14 @@ fn format_data_size(s: &str) -> Option<String> {
     };
 
     // Re-express in binary units
+    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
     const KIB: f64 = 1024.0;
 
-    if bytes >= GIB {
+    if bytes >= TIB {
+        Some(format!("{:.2} TiB", bytes / TIB))
+    } else if bytes >= GIB {
         Some(format!("{:.2} GiB", bytes / GIB))
     } else if bytes >= MIB {
         Some(format!("{:.2} MiB", bytes / MIB))
@@ -944,12 +947,12 @@ fn print_usage_rows(title: &str, rows: &[UsageRow]) {
     ]);
     for r in rows {
         t.add_row(vec![
-            r.resource.as_str(),
-            r.allotted.as_str(),
-            r.up_to_last_session.as_str(),
-            r.current_session.as_str(),
-            r.total.as_str(),
-            r.remaining.as_str(),
+            r.resource.clone(),
+            format_data_size(&r.allotted).unwrap_or_else(|| r.allotted.clone()),
+            format_data_size(&r.up_to_last_session).unwrap_or_else(|| r.up_to_last_session.clone()),
+            format_data_size(&r.current_session).unwrap_or_else(|| r.current_session.clone()),
+            format_data_size(&r.total).unwrap_or_else(|| r.total.clone()),
+            format_data_size(&r.remaining).unwrap_or_else(|| r.remaining.clone()),
         ]);
     }
     right_align(&mut t, &[1, 2, 3, 4, 5]);
