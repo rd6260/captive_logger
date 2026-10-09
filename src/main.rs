@@ -106,6 +106,10 @@ struct Cli {
     #[arg(short = 'A', long)]
     all: bool,
 
+    /// Show only the remaining data in the current daily cycle (single line)
+    #[arg(short = 'r', long)]
+    remaining: bool,
+
     /// Profile name or ID to use for the flags above (opens fzf if omitted)
     #[arg(short, long, value_name = "NAME_OR_ID")]
     profile: Option<String>,
@@ -178,6 +182,40 @@ fn human(n: u64) -> String {
         n /= 1024.0;
     }
     format!("{:.2} TB", n)
+}
+
+/// Parses a portal data string like "8095.75 MB" or "1.2 GB" into bytes,
+/// then formats it in binary units (GiB / MiB / KiB / B), choosing the
+/// largest unit that keeps the value ≥ 1.
+fn format_data_size(s: &str) -> Option<String> {
+    let s = s.trim();
+    let (num_part, unit_part) = s.rsplit_once(' ')?;
+    let value: f64 = num_part.trim().parse().ok()?;
+
+    // Convert to bytes using SI units (the portal reports MB/GB, not MiB/GiB)
+    let bytes: f64 = match unit_part.trim().to_uppercase().as_str() {
+        "B"   => value,
+        "KB"  => value * 1_000.0,
+        "MB"  => value * 1_000_000.0,
+        "GB"  => value * 1_000_000_000.0,
+        "TB"  => value * 1_000_000_000_000.0,
+        _     => return None,
+    };
+
+    // Re-express in binary units
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+
+    if bytes >= GIB {
+        Some(format!("{:.2} GiB", bytes / GIB))
+    } else if bytes >= MIB {
+        Some(format!("{:.2} MiB", bytes / MIB))
+    } else if bytes >= KIB {
+        Some(format!("{:.2} KiB", bytes / KIB))
+    } else {
+        Some(format!("{:.0} B", bytes))
+    }
 }
 
 fn str_field(v: &Value, key: &str) -> String {
@@ -831,13 +869,59 @@ fn right_align(table: &mut Table, cols: &[usize]) {
     }
 }
 
+/// Parses a "HH:MM" string (hours can be very large) and formats it as
+/// "X years X months X days X hours X mins", omitting leading zero units.
+fn format_hhmm(s: &str) -> Option<String> {
+    let (h_part, m_part) = s.split_once(':')?;
+    let total_hours: u64 = h_part.trim().parse().ok()?;
+    let minutes: u64 = m_part.trim().parse().ok()?;
+    if minutes > 59 {
+        return None;
+    }
+
+    let total_minutes = total_hours * 60 + minutes;
+
+    const MINS_PER_YEAR: u64 = 60 * 24 * 365;
+    const MINS_PER_MONTH: u64 = 60 * 24 * 30;
+    const MINS_PER_DAY: u64 = 60 * 24;
+
+    let years = total_minutes / MINS_PER_YEAR;
+    let rem = total_minutes % MINS_PER_YEAR;
+    let months = rem / MINS_PER_MONTH;
+    let rem = rem % MINS_PER_MONTH;
+    let days = rem / MINS_PER_DAY;
+    let rem = rem % MINS_PER_DAY;
+    let hours = rem / 60;
+    let mins = rem % 60;
+
+    let mut parts: Vec<String> = Vec::new();
+    if years > 0 { parts.push(format!("{years} year{}", if years == 1 { "" } else { "s" })); }
+    if months > 0 { parts.push(format!("{months} month{}", if months == 1 { "" } else { "s" })); }
+    if days > 0 { parts.push(format!("{days} day{}", if days == 1 { "" } else { "s" })); }
+    if hours > 0 { parts.push(format!("{hours} hour{}", if hours == 1 { "" } else { "s" })); }
+    if mins > 0 { parts.push(format!("{mins} min{}", if mins == 1 { "" } else { "s" })); }
+
+    if parts.is_empty() {
+        Some("0 mins".to_string())
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+
 fn print_policy(policy: &Map<String, Value>) {
     print_title("Policy information");
     let mut t = new_table();
     for (k, v) in policy {
+        let raw = v.as_str().unwrap_or("");
+        let display = if k == "Time Used" {
+            format_hhmm(raw).unwrap_or_else(|| raw.to_string())
+        } else {
+            raw.to_string()
+        };
         t.add_row(vec![
             Cell::new(k).add_attribute(Attribute::Bold),
-            Cell::new(v.as_str().unwrap_or("")),
+            Cell::new(display),
         ]);
     }
     println!("{t}");
@@ -948,6 +1032,7 @@ fn run_query(cli: &Cli, config: &Config) -> Result<()> {
     let want_stats = cli.stats || cli.all;
     let want_sessions = cli.sessions || cli.all;
     let want_summary = cli.usage;
+    let want_remaining = cli.remaining;
 
     // Validate --month before hitting the network
     let range = if want_sessions {
@@ -972,8 +1057,20 @@ fn run_query(cli: &Cli, config: &Config) -> Result<()> {
         sessions: None,
     };
 
-    if want_stats || want_summary {
+    if want_stats || want_summary || want_remaining {
         let status = portal.account_status()?;
+        if want_remaining {
+            // Find the first cycle row that has a real remaining value
+            let remaining = status
+                .cycle_usage
+                .iter()
+                .find(|r| !r.remaining.is_empty() && r.remaining != "N/A")
+                .map(|r| r.remaining.as_str())
+                .unwrap_or("N/A");
+            let display = format_data_size(remaining).unwrap_or_else(|| remaining.to_string());
+            println!("{display}");
+            return Ok(());
+        }
         if want_summary {
             report.daily_cycle_summary = Some(cycle_summary(&status.cycle_usage));
         }
@@ -1011,7 +1108,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.stats || cli.usage || cli.sessions || cli.all {
+    if cli.stats || cli.usage || cli.sessions || cli.all || cli.remaining {
         return run_query(&cli, &config);
     }
 
