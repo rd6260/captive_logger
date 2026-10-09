@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Local, NaiveDate};
 use clap::Parser;
-use comfy_table::{presets::UTF8_FULL, Attribute, Cell, CellAlignment, Table};
+use comfy_table::{presets::UTF8_BORDERS_ONLY, Attribute, Cell, CellAlignment, Table};
 use console::{style, Term};
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -815,7 +815,7 @@ fn month_range(month: Option<&str>) -> Result<(String, String, String)> {
 
 fn new_table() -> Table {
     let mut t = Table::new();
-    t.load_style(UTF8_FULL);
+    t.load_style(UTF8_BORDERS_ONLY);
     t
 }
 
