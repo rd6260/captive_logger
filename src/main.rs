@@ -1076,7 +1076,14 @@ fn run_query(cli: &Cli, config: &Config) -> Result<()> {
                 .map(|r| r.remaining.as_str())
                 .unwrap_or("N/A");
             let display = format_data_size(remaining).unwrap_or_else(|| remaining.to_string());
-            println!("{display}");
+            if cli.json {
+                println!("{}", serde_json::json!({
+                    "profile": { "name": report.profile.name, "id": report.profile.id },
+                    "remaining": display,
+                }));
+            } else {
+                println!("{display}");
+            }
             return Ok(());
         }
         if want_summary {
