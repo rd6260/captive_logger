@@ -1,6 +1,6 @@
 [package]
 name = "captive_logger"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [[bin]]
@@ -8,9 +8,15 @@ name = "autologger"
 path = "src/main.rs"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["blocking"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+comfy-table = "8.0.1"
 console = "0.16.6"
+regex = "1.13.1"
+# 0.13 made `form` and `query` opt-in features and switched the default TLS to rustls
+reqwest = { version = "0.13.5", features = ["blocking", "cookies", "form", "query"] }
+scraper = "0.27.0"
+serde = { version = "1.0.229", features = ["derive"] }
+# preserve_order keeps the policy table in the same order as the portal shows it
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
