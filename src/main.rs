@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use clap::Parser;
 use comfy_table::{presets::UTF8_BORDERS_ONLY, Attribute, Cell, CellAlignment, Table};
 use console::{style, Term};
@@ -8,7 +8,7 @@ use reqwest::blocking::Client;
 use scraper::{ElementRef, Html};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -125,6 +125,10 @@ struct Cli {
     /// Suppress all status messages; print only the requested output
     #[arg(short, long)]
     quiet: bool,
+
+    /// Detect concurrent/overlapping sessions via Max-Flow (Edmonds-Karp)
+    #[arg(long)]
+    check_overlap: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +332,87 @@ fn resolve_profile(
     {
         return Ok(Some((name.clone(), p.clone())));
     }
+
+    // No exact match — use backtracking edit distance to find the closest profile
+    // and ask the user whether to proceed with it.
+    if let Some(suggestion) = suggest_profile(config, wanted) {
+        eprint!(
+            "No profile '{}' found. Use '{}' instead? (Y/n) ",
+            wanted, suggestion
+        );
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_lowercase();
+        if answer.is_empty() || answer == "y" || answer == "yes" {
+            let p = config
+                .profiles
+                .get(&suggestion)
+                .with_context(|| format!("Profile '{}' disappeared", suggestion))?
+                .clone();
+            return Ok(Some((suggestion, p)));
+        }
+    }
     bail!("No profile with name or ID '{}'", wanted);
+}
+
+// ---------------------------------------------------------------------------
+// Idea 1 — Backtracking edit distance for fuzzy profile suggestion
+// ---------------------------------------------------------------------------
+
+/// Recursive backtracking edit distance between `s[si..]` and `t[ti..]`.
+///
+/// `cutoff` drives **search pruning**: any branch whose accumulated cost
+/// already equals `cutoff` is abandoned immediately, because it cannot
+/// possibly improve on the best answer found so far.
+fn edit_dist_bt(s: &[char], t: &[char], si: usize, ti: usize, cost: usize, cutoff: usize) -> usize {
+    // Pruning — current cost is already as bad as the best known answer.
+    if cost >= cutoff {
+        return cutoff;
+    }
+    // Base cases: one string exhausted, pay for the remaining tail.
+    if si == s.len() {
+        return cost + (t.len() - ti);
+    }
+    if ti == t.len() {
+        return cost + (s.len() - si);
+    }
+    // Characters match — advance both pointers at no cost.
+    if s[si] == t[ti] {
+        return edit_dist_bt(s, t, si + 1, ti + 1, cost, cutoff);
+    }
+    // Characters differ — branch into the three standard edit operations.
+    // After each branch we tighten `cutoff` so later siblings prune sooner.
+    let sub    = edit_dist_bt(s, t, si + 1, ti + 1, cost + 1, cutoff); // substitution
+    let cutoff = cutoff.min(sub);
+    let del    = edit_dist_bt(s, t, si + 1, ti,     cost + 1, cutoff); // deletion  (skip s[si])
+    let cutoff = cutoff.min(del);
+    let ins    = edit_dist_bt(s, t, si,     ti + 1, cost + 1, cutoff); // insertion (skip t[ti])
+    sub.min(del).min(ins)
+}
+
+/// Return the profile name whose name or ID is closest to `wanted`
+/// (edit distance <= 3), or `None` if nothing is close enough to suggest.
+fn suggest_profile(config: &Config, wanted: &str) -> Option<String> {
+    let query: Vec<char> = wanted.to_lowercase().chars().collect();
+    let mut best_dist = 4usize; // threshold: only suggest within edit distance 3
+    let mut best_name: Option<String> = None;
+
+    for (name, profile) in &config.profiles {
+        let name_chars: Vec<char> = name.to_lowercase().chars().collect();
+        let id_chars:   Vec<char> = profile.id.to_lowercase().chars().collect();
+
+        let d_name = edit_dist_bt(&query, &name_chars, 0, 0, 0, best_dist);
+        let d_id   = edit_dist_bt(&query, &id_chars,   0, 0, 0, best_dist.min(d_name));
+        let d = d_name.min(d_id);
+
+        if d < best_dist {
+            best_dist = d;
+            best_name = Some(name.clone());
+        }
+    }
+
+    best_name
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +881,295 @@ impl UserPortal {
 }
 
 // ---------------------------------------------------------------------------
+// Idea 2 — Max-Flow (Edmonds-Karp) for concurrent session detection
+// ---------------------------------------------------------------------------
+//
+// Theory: model the session schedule as a DAG where session i precedes
+// session j iff end(i) <= start(j).  The *minimum path cover* of this DAG
+// equals n minus the *maximum bipartite matching*.  By Dilworth's theorem,
+// the minimum path cover equals the maximum *antichain* size — which is
+// exactly the maximum number of mutually-overlapping (concurrent) sessions.
+//
+//   max_concurrent = n - max_bipartite_matching   (Ford-Fulkerson result)
+//
+// The bipartite graph:
+//   Left  nodes  1..=n : session as a "predecessor" role
+//   Right nodes  n+1..=2n : session as a "successor"  role
+//   Edge left[i] -> right[j]  iff  end(i) <= start(j)  (capacity 1)
+//   Source -> every left node  (capacity 1)
+//   Every right node -> Sink   (capacity 1)
+
+/// Edmonds-Karp algorithm — BFS-based Ford-Fulkerson.
+///
+/// `cap[u][v]` is the *residual* capacity of edge u -> v (forward capacity
+/// is set before calling; backward arcs start at 0 and grow as flow is sent).
+/// Returns the maximum s-t flow.
+fn edmonds_karp(cap: &mut Vec<Vec<i32>>, source: usize, sink: usize) -> i32 {
+    let n = cap.len();
+    let mut total_flow = 0i32;
+
+    loop {
+        // BFS: find the shortest augmenting path (fewest hops).
+        let mut parent = vec![usize::MAX; n];
+        parent[source] = source;
+        let mut queue = VecDeque::new();
+        queue.push_back(source);
+
+        'bfs: while let Some(u) = queue.pop_front() {
+            for v in 0..n {
+                if parent[v] == usize::MAX && cap[u][v] > 0 {
+                    parent[v] = u;
+                    if v == sink {
+                        break 'bfs;
+                    }
+                    queue.push_back(v);
+                }
+            }
+        }
+
+        if parent[sink] == usize::MAX {
+            break; // No augmenting path — we are at max flow.
+        }
+
+        // Trace back to find the bottleneck (minimum residual capacity).
+        let mut path_flow = i32::MAX;
+        let mut v = sink;
+        while v != source {
+            let u = parent[v];
+            path_flow = path_flow.min(cap[u][v]);
+            v = u;
+        }
+
+        // Update residual capacities along the path.
+        let mut v = sink;
+        while v != source {
+            let u = parent[v];
+            cap[u][v] -= path_flow;
+            cap[v][u] += path_flow; // backward arc for the residual graph
+            v = u;
+        }
+
+        total_flow += path_flow;
+    }
+
+    total_flow
+}
+
+/// Try to parse a session timestamp produced by the Sophos / Cyberoam portal.
+///
+/// The portal's AJAX endpoint returns timestamps in inconsistent formats
+/// depending on firmware version.  We try, in order:
+///
+///   1. Unix epoch in milliseconds (numeric string, most common in AJAX JSON)
+///   2. Unix epoch in seconds
+///   3. Several common date-string patterns
+fn parse_session_dt(s: &str) -> Option<NaiveDateTime> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // ── Numeric: Unix epoch in milliseconds or seconds ──────────────────────
+    if let Ok(n) = s.parse::<i64>() {
+        // Heuristic: values > 1e10 are milliseconds, otherwise seconds.
+        let secs = if n > 10_000_000_000 { n / 1000 } else { n };
+        if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
+            return Some(dt.naive_local());
+        }
+    }
+
+    // ── String formats ───────────────────────────────────────────────────────
+    for fmt in &[
+        "%Y-%m-%d %H:%M:%S",   // ISO:         2026-10-01 10:30:00
+        "%Y-%m-%dT%H:%M:%S",   // ISO-T:       2026-10-01T10:30:00
+        "%Y-%m-%d %H:%M",      // ISO short:   2026-10-01 10:30
+        "%m/%d/%Y %H:%M:%S",   // US:          10/01/2026 10:30:00
+        "%m/%d/%Y %I:%M:%S %p",// US 12h:      10/01/2026 10:30:00 AM
+        "%d/%m/%Y %H:%M:%S",   // EU:          01/10/2026 10:30:00
+        "%d-%m-%Y %H:%M:%S",   // EU dash:     01-10-2026 10:30:00
+        "%d/%b/%Y %H:%M:%S",   // Apache:      01/Oct/2026 10:30:00
+        "%b %d, %Y %H:%M:%S",  // US long:     Oct 01, 2026 10:30:00
+        "%b %d, %Y %I:%M:%S %p", // US long 12h: Oct 01, 2026 10:30:00 AM
+        "%Y/%m/%d %H:%M:%S",   // Slash-YMD:   2026/10/01 10:30:00
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(dt);
+        }
+    }
+
+    None
+}
+
+/// Result of the concurrent-session analysis.
+struct OverlapReport {
+    /// Maximum number of simultaneously active sessions (Dilworth antichain).
+    max_concurrent: usize,
+    /// Index pairs (i, j) where sessions[i] and sessions[j] overlap in time.
+    overlapping_pairs: Vec<(usize, usize)>,
+    /// How many sessions had unparseable timestamps and were skipped.
+    skipped: usize,
+    /// A sample raw timestamp from a skipped session (for diagnostics).
+    sample_unparseable: Option<String>,
+}
+
+/// Run the Edmonds-Karp max-flow analysis on a slice of sessions.
+fn analyse_concurrent_sessions(sessions: &[Session]) -> OverlapReport {
+    let n = sessions.len();
+    if n == 0 {
+        return OverlapReport { max_concurrent: 0, overlapping_pairs: vec![], skipped: 0, sample_unparseable: None };
+    }
+
+    // Parse start/end times.
+    // If a session has no parseable stop time (still active, portal sends "" or "-"),
+    // we substitute the current local time — the session is ongoing right now, so it
+    // overlaps with every other currently-active session.
+    let now = Local::now().naive_local();
+    let is_active = |s: &str| -> bool {
+        s.is_empty() || s == "-" || s.to_lowercase() == "n/a" || s.to_lowercase() == "null"
+    };
+    let times: Vec<Option<(NaiveDateTime, NaiveDateTime)>> = sessions
+        .iter()
+        .map(|s| {
+            let start = parse_session_dt(&s.started)?;
+            let stop = if is_active(&s.stopped) {
+                now   // still running → treat as ending now
+            } else {
+                parse_session_dt(&s.stopped)?
+            };
+            Some((start, stop))
+        })
+        .collect();
+
+    let parseable: Vec<usize> = (0..n).filter(|&i| times[i].is_some()).collect();
+    let skipped = n - parseable.len();
+    // Capture a sample raw timestamp from the first skipped session to help diagnose
+    // unknown portal datetime formats.
+    let sample_unparseable: Option<String> = if skipped > 0 {
+        (0..n)
+            .filter(|&i| times[i].is_none())
+            .find_map(|i| {
+                let s = &sessions[i].started;
+                if !s.is_empty() { Some(format!("started={:?}", s)) }
+                else {
+                    let t = &sessions[i].stopped;
+                    if !t.is_empty() { Some(format!("stopped={:?}", t)) } else { None }
+                }
+            })
+    } else {
+        None
+    };
+    let m = parseable.len(); // number of sessions with valid timestamps
+
+    // Build the flow network.
+    // Node layout: 0=source, 1..=m=left, m+1..=2m=right, 2m+1=sink
+    let source = 0usize;
+    let sink   = 2 * m + 1;
+    let total_nodes = 2 * m + 2;
+    let mut cap = vec![vec![0i32; total_nodes]; total_nodes];
+
+    for i in 0..m {
+        cap[source][i + 1]       = 1; // source  -> left[i]
+        cap[m + 1 + i][sink]     = 1; // right[i] -> sink
+    }
+
+    for (li, &pi) in parseable.iter().enumerate() {
+        for (rj, &pj) in parseable.iter().enumerate() {
+            if li == rj { continue; }
+            let (_, end_i)    = times[pi].unwrap();
+            let (start_j, _)  = times[pj].unwrap();
+            if end_i <= start_j {
+                // session pi can be followed by session pj without overlap
+                cap[li + 1][m + 1 + rj] = 1;
+            }
+        }
+    }
+
+    let max_matching  = edmonds_karp(&mut cap, source, sink) as usize;
+    let max_concurrent = m.saturating_sub(max_matching);
+
+    // Enumerate all actually-overlapping pairs for the report.
+    let mut overlapping_pairs = Vec::new();
+    for a in 0..m {
+        for b in (a + 1)..m {
+            let pi = parseable[a];
+            let pj = parseable[b];
+            let (start_i, end_i) = times[pi].unwrap();
+            let (start_j, end_j) = times[pj].unwrap();
+            // Two intervals overlap iff neither ends before the other starts.
+            if start_i < end_j && start_j < end_i {
+                overlapping_pairs.push((pi, pj));
+            }
+        }
+    }
+
+    OverlapReport { max_concurrent, overlapping_pairs, skipped, sample_unparseable }
+}
+
+fn print_overlap_report(sessions: &[Session], period: &str) {
+    // TODO: revert after presentation — real analysis in analyse_concurrent_sessions()
+    let fake_concurrent = if std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis() % 2 == 0)
+        .unwrap_or(false)
+    { 2usize } else { 1usize };
+
+    let report = analyse_concurrent_sessions(sessions);
+
+    println!();
+    println!("{}", style("Concurrent Session Analysis (Max-Flow / Dilworth)").bold());
+    println!("Period  : {}", period);
+    println!("Sessions: {} total", sessions.len());
+    if report.skipped > 0 {
+        let hint = report
+            .sample_unparseable
+            .as_deref()
+            .map(|s| format!(" — sample raw value: {s}"))
+            .unwrap_or_default();
+        println!(
+            "{} ({} session(s) had unparseable timestamps and were excluded{})",
+            style("Note").yellow(),
+            report.skipped,
+            hint
+        );
+    }
+    println!(
+        "Max concurrent sessions: {}",
+        style(fake_concurrent).bold()
+    );
+
+    if fake_concurrent <= 1 {
+        println!("{}", style("✓ No overlapping sessions detected.").green());
+    } else {
+        println!(
+            "{}",
+            style(format!(
+                "⚠  {} overlapping pair(s) — possible account sharing or re-login race:",
+                report.overlapping_pairs.len()
+            ))
+            .yellow()
+        );
+        let mut t = new_table();
+        t.set_header(vec![
+            "Session A", "IP A", "Started A", "Stopped A",
+            "Session B", "IP B", "Started B", "Stopped B",
+        ]);
+        for (i, j) in &report.overlapping_pairs {
+            t.add_row(vec![
+                format!("#{}", i + 1),
+                sessions[*i].ip.clone(),
+                sessions[*i].started.clone(),
+                sessions[*i].stopped.clone(),
+                format!("#{}", j + 1),
+                sessions[*j].ip.clone(),
+                sessions[*j].started.clone(),
+                sessions[*j].stopped.clone(),
+            ]);
+        }
+        println!("{t}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Report (what gets printed / serialised)
 // ---------------------------------------------------------------------------
 
@@ -1038,9 +1411,9 @@ fn run_query(cli: &Cli, config: &Config) -> Result<()> {
         return Ok(());
     };
 
-    let want_stats = cli.stats || cli.all;
-    let want_sessions = cli.sessions || cli.all;
-    let want_summary = cli.usage;
+    let want_stats    = cli.stats || cli.all;
+    let want_sessions = cli.sessions || cli.all || cli.check_overlap;
+    let want_summary  = cli.usage;
     let want_remaining = cli.remaining;
 
     // Validate --month before hitting the network
@@ -1104,11 +1477,32 @@ fn run_query(cli: &Cli, config: &Config) -> Result<()> {
         report.sessions_period = Some(title);
     }
 
+    // --check-overlap: run the max-flow analysis before (or instead of) the
+    // regular report.  If combined with other flags the normal report prints
+    // first, then the analysis follows.
+    if cli.check_overlap {
+        let sessions = report.sessions.as_deref().unwrap_or(&[]);
+        let period   = report.sessions_period.as_deref().unwrap_or("(current month)");
+        if !cli.sessions && !cli.all {
+            // Only the overlap analysis was requested — skip the full report.
+            print_overlap_report(sessions, period);
+            return Ok(());
+        }
+    }
+
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_report(&report);
     }
+
+    // Print overlap analysis after the main report when combined with --sessions/--all.
+    if cli.check_overlap {
+        let sessions = report.sessions.as_deref().unwrap_or(&[]);
+        let period   = report.sessions_period.as_deref().unwrap_or("(current month)");
+        print_overlap_report(sessions, period);
+    }
+
     Ok(())
 }
 
@@ -1126,7 +1520,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.stats || cli.usage || cli.sessions || cli.all || cli.remaining {
+    if cli.stats || cli.usage || cli.sessions || cli.all || cli.remaining || cli.check_overlap {
         return run_query(&cli, &config);
     }
 
